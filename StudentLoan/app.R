@@ -3,8 +3,8 @@ library(shinythemes)
 options(scipen=999)
 
 plan1Threshold = 18935
-plan2LowerThreshold = 25725
-plan2UpperThreshold = 46305
+plan2LowerThreshold = 29385  # Updated April 2026
+plan2UpperThreshold = 52885  # Updated April 2026
 plan5Threshold = 25000
 
 # Initial values
@@ -196,13 +196,26 @@ trim <- function(x){
 
 # Monte Carlo inflation simulation
 simulate_inflation_paths <- function(nYears, meanInflation, volatility, nSims = 1000){
-  # Generate inflation paths using random walk with drift
+  # Generate inflation paths using AR(1) process with lognormal shocks
   # Returns matrix: rows = simulations, columns = years
-  set.seed(123) # For reproducibility
+  # AR(1): inflation[t] = meanInflation + rho * (inflation[t-1] - meanInflation) + shock
+
+  # No fixed seed - use system time for true randomness
   inflation_paths <- matrix(nrow = nSims, ncol = nYears)
+  rho <- 0.7  # Autocorrelation coefficient (inflation persists)
 
   for (sim in 1:nSims){
-    inflation_paths[sim, ] <- pmax(0, rnorm(nYears, mean = meanInflation, sd = volatility))
+    inflation_path <- numeric(nYears)
+    inflation_path[1] <- max(0, rnorm(1, mean = meanInflation, sd = volatility))
+
+    for (t in 2:nYears){
+      # AR(1) process: current inflation depends on previous year
+      shock <- rnorm(1, mean = 0, sd = volatility)
+      inflation_path[t] <- meanInflation + rho * (inflation_path[t-1] - meanInflation) + shock
+      inflation_path[t] <- max(0, inflation_path[t])  # Floor at zero
+    }
+
+    inflation_paths[sim, ] <- inflation_path
   }
 
   return(inflation_paths)
@@ -218,7 +231,8 @@ get_interest_percentiles <- function(inflation_paths, startYear, salary, country
     list(
       p10 = apply(inflation_paths, 2, quantile, probs = 0.10),
       p50 = apply(inflation_paths, 2, quantile, probs = 0.50),
-      p90 = apply(inflation_paths, 2, quantile, probs = 0.90)
+      p90 = apply(inflation_paths, 2, quantile, probs = 0.90),
+      mean = apply(inflation_paths, 2, mean)  # Expected value
     )
   }else if (startYear >= 2012 && country == 'England/Wales'){ # Plan 2
     # Add salary-based component (0 to 3%)
@@ -233,14 +247,16 @@ get_interest_percentiles <- function(inflation_paths, startYear, salary, country
     list(
       p10 = apply(inflation_paths, 2, quantile, probs = 0.10) + salary_component,
       p50 = apply(inflation_paths, 2, quantile, probs = 0.50) + salary_component,
-      p90 = apply(inflation_paths, 2, quantile, probs = 0.90) + salary_component
+      p90 = apply(inflation_paths, 2, quantile, probs = 0.90) + salary_component,
+      mean = apply(inflation_paths, 2, mean) + salary_component
     )
   }else{ # Plan 1 - fixed rate, return as-is
     current_rate <- intRate_calc(startYear, salary, country)
     list(
       p10 = rep(current_rate, ncol(inflation_paths)),
       p50 = rep(current_rate, ncol(inflation_paths)),
-      p90 = rep(current_rate, ncol(inflation_paths))
+      p90 = rep(current_rate, ncol(inflation_paths)),
+      mean = rep(current_rate, ncol(inflation_paths))
     )
   }
 }
@@ -478,6 +494,23 @@ server <- function(input, output, session) {
     }
   })
 
+  # Expected value (mean across all paths)
+  PAYEbalances_mean <- eventReactive(input$generate, {
+    if (!is.null(inflation_percentiles())){
+      PAYEbalances_mc(input$loan, salaries(), input$country, input$startYear, length(paymentYears()), inflation_percentiles()$mean, lumpSum = 0)
+    }else{
+      NULL
+    }
+  })
+
+  PAYEpaid_mean <- eventReactive(input$generate, {
+    if (!is.null(inflation_percentiles())){
+      PAYEpaid_mc(input$loan, salaries(), input$country, input$startYear, length(paymentYears()), inflation_percentiles()$mean, lumpSum = 0)
+    }else{
+      NULL
+    }
+  })
+
   repayBalances <- eventReactive(input$generate, {
     PAYEbalances_calc(input$loan, salaries(), input$country, input$startYear, length(paymentYears()), input$loanInterest, customInterest = input$customInterest, input$savings)
   })
@@ -616,7 +649,6 @@ server <- function(input, output, session) {
     data.frame(paymentYears()[0:length(salaries())], salaries())
   })
   
-  
   PAYE_plot <- eventReactive(input$generate,{
     # Base case: median projection
     if (input$salaryIncrease > 0 && input$plotSalary == TRUE){
@@ -627,8 +659,26 @@ server <- function(input, output, session) {
         # Add Monte Carlo uncertainty bands if available
         if (!is.null(PAYEbalances_lower()) && !is.null(PAYEbalances_upper())){
           years <- paymentYears()[0:length(PAYEbalances())]
+
+          # Handle length mismatches by padding shorter vectors with zeros
+          lower <- PAYEbalances_lower()
+          upper <- PAYEbalances_upper()
+          max_len <- max(length(lower), length(upper), length(PAYEbalances()))
+
+          if (length(lower) < max_len) {
+            lower <- c(lower, rep(0, max_len - length(lower)))
+          }
+          if (length(upper) < max_len) {
+            upper <- c(upper, rep(0, max_len - length(upper)))
+          }
+
+          # Truncate to median length for clean plotting
+          min_len <- length(PAYEbalances())
+          lower <- lower[1:min_len]
+          upper <- upper[1:min_len]
+
           polygon(c(years, rev(years)),
-                  c(PAYEbalances_lower(), rev(PAYEbalances_upper())),
+                  c(lower, rev(upper)),
                   col = rgb(0.5, 0.5, 0.5, 0.3), border = NA)
           lines(years, PAYEbalances(), type = "b", pch = 15, lwd = 2)
         }
@@ -659,8 +709,26 @@ server <- function(input, output, session) {
       # Add Monte Carlo uncertainty bands if available
       if (!is.null(PAYEbalances_lower()) && !is.null(PAYEbalances_upper())){
         years <- paymentYears()[0:length(PAYEbalances())]
+
+        # Handle length mismatches
+        lower <- PAYEbalances_lower()
+        upper <- PAYEbalances_upper()
+        max_len <- max(length(lower), length(upper), length(PAYEbalances()))
+
+        if (length(lower) < max_len) {
+          lower <- c(lower, rep(0, max_len - length(lower)))
+        }
+        if (length(upper) < max_len) {
+          upper <- c(upper, rep(0, max_len - length(upper)))
+        }
+
+        # Truncate to median length
+        min_len <- length(PAYEbalances())
+        lower <- lower[1:min_len]
+        upper <- upper[1:min_len]
+
         polygon(c(years, rev(years)),
-                c(PAYEbalances_lower(), rev(PAYEbalances_upper())),
+                c(lower, rev(upper)),
                 col = rgb(0.5, 0.5, 0.5, 0.3), border = NA)
         lines(years, PAYEbalances(), type = "b", pch = 15, lwd = 2)
 
@@ -694,8 +762,9 @@ server <- function(input, output, session) {
     mcText <- if (!is.null(PAYEbalances_lower()) && !is.null(PAYEbalances_upper())){
       paste('The shaded area shows the uncertainty range (10th to 90th percentile) based on inflation volatility of ±',
             input$inflationVolatility, '% around a mean of ', input$inflationMean, '%. ',
-            'In the best case (low inflation), you would pay £', trim(round(PAYEpaid_lower(), 0)),
-            '. In the worst case (high inflation), you would pay £', trim(round(PAYEpaid_upper(), 0)), '.', sep='')
+            'Best case (low inflation): £', trim(round(PAYEpaid_lower(), 0)),
+            '. Worst case (high inflation): £', trim(round(PAYEpaid_upper(), 0)),
+            '. Expected value (mean): £', trim(round(PAYEpaid_mean(), 0)), '.', sep='')
     }else{
       ''
     }
