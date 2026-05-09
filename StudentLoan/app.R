@@ -5,6 +5,7 @@ options(scipen=999)
 plan1Threshold = 18935
 plan2LowerThreshold = 25725
 plan2UpperThreshold = 46305
+plan5Threshold = 25000
 
 # Initial values
 age = 24
@@ -22,6 +23,8 @@ country = 'England/Wales'
 intRate_calc <- function(startYear, salary, country){
   if (startYear < 2012 | country == 'Scotland'){ # if Plan 1 loan
     return(1.75)
+  }else if (startYear >= 2023){ # if Plan 5 loan (courses starting from Aug 2023)
+    return(3.2) # RPI only rate for 2025/26
   }else{ # if Plan 2 loan
     if (salary >= plan2UpperThreshold){ # if salary is above upper threshold
       return(5.4) # max interest rate
@@ -42,6 +45,14 @@ payments_calc <- function(salaries, country, startYear){ #increases payments wit
     for (s in salaries){
       if (s > plan1Threshold){ # if salary is larger than threshold
         paymentList <- c(paymentList, .09*(s-plan1Threshold)) # payment is 9% of salary above threshold
+      }else{
+        paymentList <- c(paymentList, 0) # otherwise payment is zero
+      }
+    }
+  }else if (startYear >= 2023){ # if Plan 5 loan
+    for (s in salaries){
+      if (s > plan5Threshold){ # if salary is larger than threshold
+        paymentList <- c(paymentList, .09*(s-plan5Threshold)) # payment is 9% of salary above threshold
       }else{
         paymentList <- c(paymentList, 0) # otherwise payment is zero
       }
@@ -76,8 +87,10 @@ paymentYears_calc <- function(startYear, gradYear, country, age){
     nYears <- 64 - age
   }else if (startYear > 2006 && startYear < 2012 && country == 'England/Wales'){
     nYears <- 25 - (as.numeric(format(Sys.Date(), "%Y")) - gradYear) # 25 year forgiveness
-  }else if (startYear >= 2012 && country == 'England/Wales'){
-    nYears <- 30 - (as.numeric(format(Sys.Date(), "%Y")) - gradYear) # 25 year forgiveness
+  }else if (startYear >= 2012 && startYear < 2023 && country == 'England/Wales'){
+    nYears <- 30 - (as.numeric(format(Sys.Date(), "%Y")) - gradYear) # 30 year forgiveness
+  }else if (startYear >= 2023 && country == 'England/Wales'){
+    nYears <- 40 - (as.numeric(format(Sys.Date(), "%Y")) - gradYear) # 40 year forgiveness for Plan 5
   }else if (startYear < 2007 && country == 'Scotland'){
     if (65 - age < (30 - (as.numeric(format(Sys.Date(), "%Y")) - gradYear))){
       nYears <-  65 - age
@@ -323,7 +336,11 @@ server <- function(input, output, session) {
   interestInfo_text <- eventReactive(input$generate, {
     if (input$salaryIncrease > 0){
       if (input$loanInterest == 0 | input$customInterest == 'No'){
-        if (input$country == 'Scotland' | input$startYear < 2012 | input$salary > plan2UpperThreshold){
+        if (input$country == 'Scotland' | input$startYear < 2012){
+          paste('A loan interest rate of ', round(loanInterest_calc(), 2), '% has been used for the calculations. This is based on the country you lived in when you took out your loan, the year you started university, and your current salary.', sep = '')
+        }else if (input$startYear >= 2023){
+          paste('A loan interest rate of ', round(loanInterest_calc(), 2), '% has been used for the calculations. This is the RPI-only rate for Plan 5 loans.', sep = '')
+        }else if (input$salary > plan2UpperThreshold){
           paste('A loan interest rate of ', round(loanInterest_calc(), 2), '% has been used for the calculations. This is based on the country you lived in when you took out your loan, the year you started university, and your current salary.', sep = '')
         }else if (input$salary < plan2LowerThreshold && tail(salaries(), 1) > plan2LowerThreshold){
           paste('Your current loan interest rate is ', round(loanInterest_calc(), 2), '%, but this will increase as you earn more. Your interest rate is calculated based on the country you lived in when you took out your loan, the year you started university, and your current salary.', sep = '')
@@ -343,8 +360,10 @@ server <- function(input, output, session) {
           paste('Based on the information provided your loan will be forgiven once you reach 65 years of age. The remaining years until this date have been used in the calculations.')
         }else if (input$startYear < 2012){ # if English Plan 1, 25 year forgiveness
           paste('Based on the information provided your loan will be forgiven 25 years after graduation. The remaining years until this date have been used in the calculations.')
-        }else{
+        }else if (input$startYear < 2023){ # if Plan 2, 30 year forgiveness
           paste('Based on the information provided your loan will be forgiven 30 years after graduation. The remaining years until this date have been used in the calculations.')
+        }else{ # if Plan 5, 40 year forgiveness
+          paste('Based on the information provided your loan will be forgiven 40 years after graduation. The remaining years until this date have been used in the calculations.')
         }
       }else if (input$startYear < 2007){ # else if Scottish before 2007
         if (65 - input$age < 30 - (as.numeric(format(Sys.Date(), "%Y")) - input$gradYear)){ # if age forgiveness is sooner
@@ -383,6 +402,9 @@ server <- function(input, output, session) {
   
   repayEarly_text <- eventReactive(input$generate, {
     runValidations(input, text = FALSE)
+    # Calculate write-off period based on plan
+    writeOffYears <- if (input$startYear >= 2023) { 40 } else if (input$startYear >= 2012) { 30 } else { 25 }
+    
     if (input$savings == input$loan) {
       if (PAYEpaid() < input$loan){
         paste('If you pay off your student loan completely using your savings you will pay £', trim(round(input$loan-PAYEpaid(), 0)),
@@ -410,7 +432,7 @@ server <- function(input, output, session) {
             paste('Paying down your student loan means you will pay it off completely in ', length(repayBalances())-1, ' years. You will pay a total of £', trim(repayPaid() + input$savings), ', which is £', trim(PAYEpaid() - (repayPaid() + input$savings)), ' less than if you keep your savings and keep paying from your paycheque. You should think to yourself whether this saving is worth the risk of not having money put away for an emergency, or whether you could put these savings towards another goal such as buying a house or investing early in a pension.', sep = '')
           }
         }else{
-          paste('If you pay down your loan using your savings you will still not pay it off within thirty years of graduation, and at the end of this period your outstanding balance of £', trim(tail(repayBalances(), n = 1)), ' will be forgiven. You will pay a total of £', trim(repayPaid() + input$savings), ' which is £', trim(PAYEpaid() - (repayPaid() + input$savings)), ' less than if you keep your savings and keep paying from your paycheque. You should think to yourself whether this saving is worth the risk of not having money put away for an emergency, or whether you could put these savings towards another goal such as buying a house or investing early in a pension.', sep = '')
+          paste('If you pay down your loan using your savings you will still not pay it off within ', writeOffYears, ' years of graduation, and at the end of this period your outstanding balance of £', trim(tail(repayBalances(), n = 1)), ' will be forgiven. You will pay a total of £', trim(repayPaid() + input$savings), ' which is £', trim(PAYEpaid() - (repayPaid() + input$savings)), ' less than if you keep your savings and keep paying from your paycheque. You should think to yourself whether this saving is worth the risk of not having money put away for an emergency, or whether you could put these savings towards another goal such as buying a house or investing early in a pension.', sep = '')
         }
       }
     }
