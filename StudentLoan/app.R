@@ -17,6 +17,9 @@ startYear = 2014
 gradYear = 2017
 savings = 0
 country = 'England/Wales'
+inflationMean = 3.0  # Mean expected inflation (RPI)
+inflationVolatility = 1.5  # Standard deviation for Monte Carlo
+numSimulations = 1000  # Number of Monte Carlo paths
 
 ########## Functions
 # Estimate loan interest rate
@@ -103,6 +106,45 @@ paymentYears_calc <- function(startYear, gradYear, country, age){
   return(seq(as.numeric(format(Sys.Date(), "%Y")), as.numeric(format(Sys.Date(), "%Y")) + nYears, 1))
 }
 
+# Calculate balances with varying interest rates (Monte Carlo)
+PAYEbalances_mc <- function(loan, salaries, country, startYear, nYears, interest_rates, lumpSum = 0){
+  # interest_rates is a vector of rates for each year
+  payments <- payments_calc(salaries, country, startYear)
+  balances <- numeric()
+  x <- loan - lumpSum
+
+  for (i in 1:nYears){
+    if (x > payments[i]){
+      intRate <- interest_rates[i]
+      x <- (1 + intRate/100) * (x - payments[i])
+      balances <- c(balances, x)
+    }else{
+      balances <- c(balances, 0)
+      return(balances)
+    }
+  }
+  return(balances)
+}
+
+# Calculate total paid with varying interest rates
+PAYEpaid_mc <- function(loan, salaries, country, startYear, nYears, interest_rates, lumpSum = 0){
+  payments <- payments_calc(salaries, country, startYear)
+  x <- loan - lumpSum
+  paid <- 0
+
+  for (i in 1:nYears){
+    if (x > payments[i]){
+      intRate <- interest_rates[i]
+      x <- (1 + intRate/100) * (x - payments[i])
+      paid <- paid + payments[i]
+    }else{
+      paid <- paid + x
+      return(paid)
+    }
+  }
+  return(paid)
+}
+
 PAYEbalances_calc <- function(loan, salaries, country, startYear, nYears, interest, customInterest = 'No', lumpSum = 0){
   payments <- payments_calc(salaries, country, startYear)
   balances <- numeric()
@@ -150,6 +192,57 @@ PAYEpaid_calc <- function(loan, salaries, country, startYear, nYears, interest, 
 
 trim <- function(x){
   formatC(x, format = "d", big.mark = ',')
+}
+
+# Monte Carlo inflation simulation
+simulate_inflation_paths <- function(nYears, meanInflation, volatility, nSims = 1000){
+  # Generate inflation paths using random walk with drift
+  # Returns matrix: rows = simulations, columns = years
+  set.seed(123) # For reproducibility
+  inflation_paths <- matrix(nrow = nSims, ncol = nYears)
+
+  for (sim in 1:nSims){
+    inflation_paths[sim, ] <- pmax(0, rnorm(nYears, mean = meanInflation, sd = volatility))
+  }
+
+  return(inflation_paths)
+}
+
+# Calculate percentile interest rates from inflation paths
+get_interest_percentiles <- function(inflation_paths, startYear, salary, country){
+  # For Plan 5: interest = RPI only
+  # For Plan 2: interest = RPI + 0 to 3% based on salary
+  # For Plan 1: interest = fixed rate (not inflation-linked in same way)
+
+  if (startYear >= 2023){ # Plan 5
+    list(
+      p10 = apply(inflation_paths, 2, quantile, probs = 0.10),
+      p50 = apply(inflation_paths, 2, quantile, probs = 0.50),
+      p90 = apply(inflation_paths, 2, quantile, probs = 0.90)
+    )
+  }else if (startYear >= 2012 && country == 'England/Wales'){ # Plan 2
+    # Add salary-based component (0 to 3%)
+    salary_component <- if (salary >= plan2UpperThreshold) {
+      3
+    } else if (salary < plan2LowerThreshold) {
+      0
+    } else {
+      ((salary - plan2LowerThreshold) / (plan2UpperThreshold - plan2LowerThreshold)) * 3
+    }
+
+    list(
+      p10 = apply(inflation_paths, 2, quantile, probs = 0.10) + salary_component,
+      p50 = apply(inflation_paths, 2, quantile, probs = 0.50) + salary_component,
+      p90 = apply(inflation_paths, 2, quantile, probs = 0.90) + salary_component
+    )
+  }else{ # Plan 1 - fixed rate, return as-is
+    current_rate <- intRate_calc(startYear, salary, country)
+    list(
+      p10 = rep(current_rate, ncol(inflation_paths)),
+      p50 = rep(current_rate, ncol(inflation_paths)),
+      p90 = rep(current_rate, ncol(inflation_paths))
+    )
+  }
 }
 
 runValidations <- function(x, text = TRUE){
@@ -258,6 +351,24 @@ ui <- fluidPage(theme = shinytheme("flatly"),
                                     width = '300px')
                     ),
                     
+                    # Input: Inflation assumptions (Monte Carlo)
+                    h4("Inflation Uncertainty (Monte Carlo)"),
+                    numericInput(inputId = "inflationMean",
+                                 label = "Expected average RPI inflation (%):",
+                                 value = inflationMean,
+                                 min = 0,
+                                 max = 10,
+                                 step = 0.1),
+
+                    numericInput(inputId = "inflationVolatility",
+                                 label = "Inflation volatility (standard deviation, %):",
+                                 value = inflationVolatility,
+                                 min = 0,
+                                 max = 5,
+                                 step = 0.1),
+
+                    helpText("The calculator will show upper (90th percentile) and lower (10th percentile) bounds based on inflation uncertainty."),
+
                     # Input: Savings
                     numericInput(inputId = "savings",
                                  label = "Savings (enter how much you are planning on using to pay down your student loan, put zero otherwise):",
@@ -323,6 +434,50 @@ server <- function(input, output, session) {
     PAYEpaid_calc(input$loan, salaries(), input$country, input$startYear, length(paymentYears()), input$loanInterest, customInterest = input$customInterest, lumpSum = 0)
   })
   
+  # Monte Carlo inflation scenarios (only if custom interest not set)
+  inflation_percentiles <- eventReactive(input$generate, {
+    if (input$customInterest == 'No' && input$inflationVolatility > 0){
+      inflation_paths <- simulate_inflation_paths(length(paymentYears()), input$inflationMean, input$inflationVolatility, numSimulations)
+      get_interest_percentiles(inflation_paths, input$startYear, input$salary, input$country)
+    }else{
+      NULL
+    }
+  })
+
+  # Lower bound (10th percentile inflation)
+  PAYEbalances_lower <- eventReactive(input$generate, {
+    if (!is.null(inflation_percentiles())){
+      PAYEbalances_mc(input$loan, salaries(), input$country, input$startYear, length(paymentYears()), inflation_percentiles()$p10, lumpSum = 0)
+    }else{
+      NULL
+    }
+  })
+
+  # Upper bound (90th percentile inflation)
+  PAYEbalances_upper <- eventReactive(input$generate, {
+    if (!is.null(inflation_percentiles())){
+      PAYEbalances_mc(input$loan, salaries(), input$country, input$startYear, length(paymentYears()), inflation_percentiles()$p90, lumpSum = 0)
+    }else{
+      NULL
+    }
+  })
+
+  PAYEpaid_lower <- eventReactive(input$generate, {
+    if (!is.null(inflation_percentiles())){
+      PAYEpaid_mc(input$loan, salaries(), input$country, input$startYear, length(paymentYears()), inflation_percentiles()$p10, lumpSum = 0)
+    }else{
+      NULL
+    }
+  })
+
+  PAYEpaid_upper <- eventReactive(input$generate, {
+    if (!is.null(inflation_percentiles())){
+      PAYEpaid_mc(input$loan, salaries(), input$country, input$startYear, length(paymentYears()), inflation_percentiles()$p90, lumpSum = 0)
+    }else{
+      NULL
+    }
+  })
+
   repayBalances <- eventReactive(input$generate, {
     PAYEbalances_calc(input$loan, salaries(), input$country, input$startYear, length(paymentYears()), input$loanInterest, customInterest = input$customInterest, input$savings)
   })
@@ -463,13 +618,32 @@ server <- function(input, output, session) {
   
   
   PAYE_plot <- eventReactive(input$generate,{
+    # Base case: median projection
     if (input$salaryIncrease > 0 && input$plotSalary == TRUE){
       if (input$savings == 0){
         ymax <- (ceiling(max(max(PAYEbalances()), max(salaries())))/2500*2500)
         plot(PAYE_plotData(), xlab = "Year", ylab = "£", ylim = c(0, ymax*1.3), type = "b", pch = 15)
+
+        # Add Monte Carlo uncertainty bands if available
+        if (!is.null(PAYEbalances_lower()) && !is.null(PAYEbalances_upper())){
+          years <- paymentYears()[0:length(PAYEbalances())]
+          polygon(c(years, rev(years)),
+                  c(PAYEbalances_lower(), rev(PAYEbalances_upper())),
+                  col = rgb(0.5, 0.5, 0.5, 0.3), border = NA)
+          lines(years, PAYEbalances(), type = "b", pch = 15, lwd = 2)
+        }
+
         lines(salary_plotData(), col = "blue", type = "b", pch = 16)
-        legend(as.numeric(format(Sys.Date(), "%Y")), ymax*1.3, legend=c("Loan Balance", "Salary"),
-               col=c("black", "blue"), lty=1:2, cex=0.8, pch = c(15, 16))
+
+        if (!is.null(PAYEbalances_lower())){
+          legend(as.numeric(format(Sys.Date(), "%Y")), ymax*1.3,
+                 legend=c("Loan Balance (median)", "10-90% range (inflation uncertainty)", "Salary"),
+                 col=c("black", rgb(0.5, 0.5, 0.5, 0.3), "blue"),
+                 lty=c(1, 1, 1), lwd=c(1, 10, 1), cex=0.8, pch = c(15, NA, 16))
+        }else{
+          legend(as.numeric(format(Sys.Date(), "%Y")), ymax*1.3, legend=c("Loan Balance", "Salary"),
+                 col=c("black", "blue"), lty=1:2, cex=0.8, pch = c(15, 16))
+        }
       }else{
         ymax <- (ceiling(max(max(PAYEbalances()), max(salaries())))/2500*2500)
         plot(PAYE_plotData(), xlab = "Year", ylab = "£", ylim = c(0, ymax*1.3), type = "b", pch = 15)
@@ -479,7 +653,22 @@ server <- function(input, output, session) {
                col=c("black", "red", "blue"), lty=1:2, cex=0.8, pch = c(15, 17, 16))
       }
     }else if (input$savings == 0){
-      plot(PAYE_plotData(), xlab = "Year", ylab = "£", ylim = c(0, ceiling(max(PAYEbalances())/2500)*2500*1.3), type = "b", pch = 15)
+      ymax <- ceiling(max(PAYEbalances())/2500)*2500*1.3
+      plot(PAYE_plotData(), xlab = "Year", ylab = "£", ylim = c(0, ymax), type = "b", pch = 15)
+
+      # Add Monte Carlo uncertainty bands if available
+      if (!is.null(PAYEbalances_lower()) && !is.null(PAYEbalances_upper())){
+        years <- paymentYears()[0:length(PAYEbalances())]
+        polygon(c(years, rev(years)),
+                c(PAYEbalances_lower(), rev(PAYEbalances_upper())),
+                col = rgb(0.5, 0.5, 0.5, 0.3), border = NA)
+        lines(years, PAYEbalances(), type = "b", pch = 15, lwd = 2)
+
+        legend(as.numeric(format(Sys.Date(), "%Y")), ymax*0.95,
+               legend=c("Loan Balance (median)", "10-90% range (inflation uncertainty)"),
+               col=c("black", rgb(0.5, 0.5, 0.5, 0.3)),
+               lty=c(1, 1), lwd=c(1, 10), cex=0.8, pch = c(15, NA))
+      }
     }else{
       ymax <- ceiling(max(PAYEbalances()))/2500*2500
       plot(PAYE_plotData(), xlab = "Year", ylab = "£", ylim = c(0,ymax*1.3), type = "b", pch = 15)
@@ -500,6 +689,17 @@ server <- function(input, output, session) {
   
   output$PAYEStats <- eventReactive(input$generate, {
     runValidations(input, text = FALSE)
+
+    # Add Monte Carlo explanation if applicable
+    mcText <- if (!is.null(PAYEbalances_lower()) && !is.null(PAYEbalances_upper())){
+      paste('The shaded area shows the uncertainty range (10th to 90th percentile) based on inflation volatility of ±',
+            input$inflationVolatility, '% around a mean of ', input$inflationMean, '%. ',
+            'In the best case (low inflation), you would pay £', trim(round(PAYEpaid_lower(), 0)),
+            '. In the worst case (high inflation), you would pay £', trim(round(PAYEpaid_upper(), 0)), '.', sep='')
+    }else{
+      ''
+    }
+
     if (input$plotSalary == FALSE | input$salaryIncrease == 0){
       if (input$savings == 0 | input$savings == input$loan){
         plotText = 'The plot above shows the balances of your loan as you pay if off from your paycheque, including the effect of interest on your balance.'
@@ -513,8 +713,13 @@ server <- function(input, output, session) {
         plotText = 'The black squares in the plot above show the balances of your loan as you pay if off from your paycheque, including the effect of interest on your balance. The red triangles show your balances if you use your savings to pay down your loan early. The blue circles show your predicted salary as it increases over the years.'
       }
     }
+
     if (input$savings == 0 && length(PAYEbalances()) > 1) {
-      HTML(paste(plotText, PAYEStats_text(), sep='<br/><br/>'))
+      if (mcText != ''){
+        HTML(paste(plotText, mcText, PAYEStats_text(), sep='<br/><br/>'))
+      }else{
+        HTML(paste(plotText, PAYEStats_text(), sep='<br/><br/>'))
+      }
     }else if (input$savings == 0){
       HTML(paste(PAYEStats_text(), sep='<br/><br/>'))
     }else if (length(PAYEbalances()) == 1){
